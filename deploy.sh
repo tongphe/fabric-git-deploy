@@ -8,23 +8,25 @@ BRANCH=""
 REVERT_COMMIT=""
 
 ORIGIN='origin'
+SCM='scm'
 RELEASE='releases'
 CURRENT='current'
 LAST_VERSION='last_version'
+DEPLOY_CONFIRM='false'
 DEPLOY_INFO='false'
-KEEP_VERSION=5
+KEEP_VERSION=10
 LOG_POSTFIX='.log'
 DEPLOY_TIME=$(date "+%d-%m-%y %H:%M")
 LOAD_VERSION=-1
 
 function deploy_product() {
     git_clone
-    deploy_release
-    current_info
+    prepare_release
 }
 
 function git_clone() { 
     cd $PROJECT_PATH
+
     if [ ! -d $RELEASE ]; then
         mkdir $RELEASE
     fi
@@ -32,50 +34,58 @@ function git_clone() {
     if [ -d $ORIGIN ]; then
         rm -rf $ORIGIN
     fi
-    # Clone repo
-    git clone -b $BRANCH $PROJECT_URL $ORIGIN >/dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        echo "Error git clone"
-        exit 1
+    # Clone repository
+    if [[ -d $SCM && "$(ls -A $SCM)" ]]; then
+        echo "Fetching repository..."
+        cd $SCM
+        git fetch $PROJECT_URL $BRANCH:$BRANCH --force >/dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            echo "Error git fetch"
+            exit 1
+        fi
+        cd $PROJECT_PATH
+    else
+        echo "Cloning repository..."
+        git clone $PROJECT_URL $SCM --bare >/dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            echo "Error git clone"
+            exit 1
+        fi
     fi
-    echo "Cloning branch '$BRANCH'..."
+    # Clone branch
+    echo "Checkout branch '$BRANCH'."
+    git clone --recursive -b $BRANCH $SCM $ORIGIN >/dev/null 2>&1
     cd $ORIGIN
     git checkout $BRANCH
     echo "Finish cloning."
 }
 
-function deploy_release() {
-    cd $PROJECT_PATH
-    echo "Preparing to deploy..."
-    last_version=$(cat $LAST_VERSION 2>/dev/null)
-    if [ $? -ne 0 ]; then
-        last_version=0
-    fi
+function deploy_confirm() {
+    local last_version=$(get_last_version)
     last_version=$((last_version + 1))
-
-    # Log deploy info
-    deploy_log="$PROJECT_PATH/$RELEASE/$last_version$LOG_POSTFIX"
-    echo "Deploy time: $DEPLOY_TIME" >> $deploy_log 
-    echo "Deploy commit:" >> $deploy_log 
-    cd $ORIGIN
-    git log -1 >> $deploy_log
-    cd ..
-
-    # Deploy new source code
-    rm -rf "$ORIGIN/.git"
+    cd $PROJECT_PATH
     mv $ORIGIN "$RELEASE/$last_version"
     if [ $? -ne 0 ]; then
-        echo "Error deploy version"
+        echo "Error switch to version $last_version"
         exit 1
     fi
     unlink $CURRENT 2>/dev/null
     ln -s "$RELEASE/$last_version" $CURRENT
     if [ $? -ne 0 ]; then
-        echo "Error switch version"
+        echo "Error switch to version $last_version"
         exit 1
     fi
     echo $last_version > $LAST_VERSION 
+    deploy_log="$PROJECT_PATH/$RELEASE/$last_version$LOG_POSTFIX"
+    echo 'Result: Success' >> $deploy_log
+    remove_old_version
+    echo "Successfully switched to version $last_version."
+    current_info
+}
 
+function remove_old_version() {
+    local last_version=$(get_last_version)
+    cd $PROJECT_PATH
     # Remove old version
     old_version="$RELEASE/$((last_version - KEEP_VERSION))"
     if [ -d $old_version ]; then
@@ -85,8 +95,23 @@ function deploy_release() {
     if [ -f $old_version_log ]; then
         rm $old_version_log 
     fi
+}
 
-    echo "Successfully deployed."
+function prepare_release() {
+    echo "Preparing to deploy..."
+    local last_version=$(get_last_version)
+    last_version=$((last_version + 1))
+
+    cd $PROJECT_PATH
+    # Log deploy info
+    local deploy_log="$PROJECT_PATH/$RELEASE/$last_version$LOG_POSTFIX"
+    echo "Deploy time: $DEPLOY_TIME" > $deploy_log 
+    echo "Deploy commit:" >> $deploy_log 
+    cd $ORIGIN
+    git log -1 | sed '/^$/d' >> $deploy_log
+    cd ..
+
+    rm -rf "$ORIGIN/.git"
 }
 
 function git_revert() { 
@@ -103,64 +128,80 @@ function git_revert() {
         exit 1
     fi
     git clean -f
-    deploy_release
-    echo "Successfully revert commit to $REVERT_COMMIT."
-    current_info
+    prepare_release
 }
 
 function switch_back() {
-    version_back=$1
+    local version_back=$1
+    local last_version=$(get_last_version)
+    local current_version=$(get_current_version)
     cd $PROJECT_PATH
-    last_version=$(cat $LAST_VERSION)
-    current_version=$(basename $( ls -l $CURRENT | awk '{print $NF}'))
     if [ $version_back -ge $KEEP_VERSION ]; then
         echo "Error revert version too far"
         exit 1
     fi
-    revert_version=$((last_version - version_back))
+    local revert_version=$((last_version - version_back))
     if [ $current_version -eq $revert_version ]; then
         echo "Error already on version $revert_version"
         exit 1
     fi
     if [ ! -d "$RELEASE/$revert_version" ]; then
-        echo "Error version doesn't exist"
+        echo "Error version $revert_version doesn't exist"
         exit 1
     fi
 
     unlink $CURRENT 2>/dev/null
-    ln -s "$RELEASE/$((last_version - version_back))" $CURRENT
+    ln -s "$RELEASE/$revert_version" $CURRENT
     if [ $? -ne 0 ]; then
-        echo "Error switch version"
+        echo "Error switch to version $revert_version"
         exit 1
     fi
 
-    echo "Successfully switch $version_back version."
+    echo "Successfully switched to version $revert_version."
     current_info
 }
 
-function current_info() {
+function get_last_version() {
     cd $PROJECT_PATH
-    current_version=$(basename $( ls -l $CURRENT | awk '{print $NF}'))
+    local last_version=$(cat $LAST_VERSION 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        last_version=0
+    fi
+    echo $last_version
+}
+
+function get_current_version() {
+    cd $PROJECT_PATH
+    local current_version=$(basename $( ls -l $CURRENT | awk '{print $NF}'))
+    if [ $? -ne 0 ]; then
+        current_version=$(get_last_version)
+    fi
+    echo $current_version
+}
+
+function current_info() {
+    local current_version=$(get_current_version)
+    cd $PROJECT_PATH
     echo "Current version: $current_version"
-    echo "Latest version: $(cat $LAST_VERSION)"
-    current_log="$RELEASE/$current_version$LOG_POSTFIX"
+    echo "Latest version: $(get_last_version)"
+    local current_log="$RELEASE/$current_version$LOG_POSTFIX"
+    echo "----------------------------------------"
+    echo "Version $current_version:"
     if [ -f $current_log ]; then
-        echo "----------------------------------------"
-        echo "Version $current_version:"
         cat $current_log
     fi
 }
 
 function deploy_info() {
     current_info 
-    last_version=$(cat $LAST_VERSION)
+    local last_version=$(get_last_version)
     cd $PROJECT_PATH
     echo "Last $KEEP_VERSION versions infomations:"
     for ((version=last_version;version>last_version-KEEP_VERSION;version--)); do
-        log_version="$RELEASE/$version$LOG_POSTFIX"
+        local log_version="$RELEASE/$version$LOG_POSTFIX"
+        echo "----------------------------------------"
+        echo "Version $version:"
         if [ -f $log_version ]; then
-            echo "----------------------------------------"
-            echo "Version $version:"
             cat $log_version
         fi
     done
@@ -224,6 +265,11 @@ function init_settings() {
 
 function main() {
     # Deploy or Revert product
+    if [ "$DEPLOY_CONFIRM" == "true" ]; then
+        deploy_confirm
+        exit 0
+    fi
+
     if [ "$DEPLOY_INFO" == "true" ]; then
         deploy_info
         exit 0
@@ -244,7 +290,7 @@ function main() {
 }
 
 # Init deploy options
-while getopts "p:u:b:r:l:t:i-" opt; do
+while getopts "p:u:b:r:l:t:ic-" opt; do
     case $opt in
         p)
             PROJECT_PATH="$OPTARG";;
@@ -258,6 +304,8 @@ while getopts "p:u:b:r:l:t:i-" opt; do
             LOAD_VERSION=$OPTARG;;
         i)
             DEPLOY_INFO='true';;
+        c)
+            DEPLOY_CONFIRM='true';;
         t)
             DEPLOY_TIME="$OPTARG";;
         -)
